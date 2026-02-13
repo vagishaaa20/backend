@@ -183,3 +183,4 @@ server.listen(PORT, () => {
     console.log(`Webhook URL: ${BASE_URL}/vapi-webhook`);
     console.log(`Health Check: ${BASE_URL}/health`);
     console.log(`WebSocket: wss://detectscam.onrender.com`);
+});
