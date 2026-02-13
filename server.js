@@ -1,189 +1,185 @@
 // ============================================
-// REAL-TIME FRAUD DETECTION SERVER (Render-ready)
+// FRAUD DETECTION WEBHOOK SERVER
+// npm install express ws node-fetch
+// node server.js
 // ============================================
 
 const express = require('express');
 const http = require('http');
 const WebSocket = require('ws');
+const fetch = require('node-fetch');
 
 const app = express();
-app.use(express.json({ limit: '10mb' }));
-app.use(express.urlencoded({ extended: true }));
+app.use(express.json());
 
+// ============================================
+// VAPI CONFIG
+// ============================================
+const VAPI_API_KEY = process.env.VAPI_API_KEY;
+const ASSISTANT_ID = process.env.ASSISTANT_ID;
+const BASE_URL = "https://detectscam.onrender.com";
+
+// Function to trigger AI agent
+async function triggerAgent(phoneNumber) {
+    try {
+        const response = await fetch('https://api.vapi.ai/call', {
+            method: 'POST',
+            headers: {
+                'Authorization': `Bearer ${VAPI_API_KEY}`,
+                'Content-Type': 'application/json'
+            },
+            body: JSON.stringify({
+                assistantId: ASSISTANT_ID,
+                phoneNumber: phoneNumber
+            })
+        });
+
+        const data = await response.json();
+        console.log('🤖 Agent triggered:', data);
+    } catch (err) {
+        console.error('Agent trigger error:', err);
+    }
+}
+
+// Create HTTP server
 const server = http.createServer(app);
+
+// Create WebSocket server
 const wss = new WebSocket.Server({ server });
 
-// -------------------- State --------------------
+// Store connected mobile apps
 const connectedApps = new Set();
-const fraudTriggeredCalls = new Set();
-
-// -------------------- Fraud Keywords --------------------
-const fraudKeywords = [
-  'otp', 'one time password', 'pin', 'cvv', 'password',
-  'kyc', 'account blocked', 'blocked', 'suspended',
-  'pay now', 'transfer', 'send money', 'upi',
-  'verify your account',
-  'arrest', 'police', 'cbi', 'income tax', 'legal action',
-  'anydesk', 'teamviewer',
-  // Hindi / Hinglish
-  'गिरफ्तार', 'केवाईसी', 'ब्लॉक', 'पैसे भेजो',
-  'ओटीपी', 'पिन'
-].map(k => k.toLowerCase());
 
 // ============================================
-// WebSocket: Mobile App (ALERT SOCKET)
+// WEBSOCKET CONNECTION (Mobile App)
 // ============================================
 wss.on('connection', (ws) => {
-  console.log('📱 Mobile app connected');
-  connectedApps.add(ws);
+    console.log('📱 Mobile app connected');
+    connectedApps.add(ws);
 
-  ws.isAlive = true;
-
-  ws.on('pong', () => {
-    ws.isAlive = true;
-  });
-
-  ws.on('close', () => {
-    connectedApps.delete(ws);
-    console.log('📴 Mobile app disconnected');
-  });
-
-  ws.on('error', (e) => {
-    console.log('⚠️ WS error:', e?.message);
-  });
+    ws.on('close', () => {
+        connectedApps.delete(ws);
+        console.log('📴 Mobile app disconnected');
+    });
 });
 
-// Keep WebSocket alive (important on Render)
-setInterval(() => {
-  wss.clients.forEach((ws) => {
-    if (ws.isAlive === false) return ws.terminate();
-    ws.isAlive = false;
-    try { ws.ping(); } catch {}
-  });
-}, 20000);
-
-// Broadcast helper
-function sendToApps(event) {
-  const payload = JSON.stringify(event);
-  let sent = 0;
-
-  for (const ws of connectedApps) {
-    if (ws.readyState === WebSocket.OPEN) {
-      ws.send(payload);
-      sent++;
-    }
-  }
-
-  console.log(`➡️ Sent ${event.type} to ${sent} app(s) (active=${connectedApps.size})`);
+// Broadcast alerts to all connected apps
+function sendAlertToApps(event) {
+    connectedApps.forEach(ws => {
+        if (ws.readyState === WebSocket.OPEN) {
+            ws.send(JSON.stringify(event));
+        }
+    });
 }
 
 // ============================================
-// VAPI WEBHOOK
+// VAPI WEBHOOK ENDPOINT
 // ============================================
 app.post('/vapi-webhook', (req, res) => {
-  // Be resilient to payload shapes
-  let message = req.body?.message || req.body;
+    const message = req.body.message;
+    console.log('📥 Vapi Event:', message?.type);
 
-  // Vapi (or proxies) can sometimes send arrays/batches
-  if (Array.isArray(message)) message = message[0];
+    // Transcript-based fraud detection
+    if (message?.type === 'transcript') {
+        const transcript = (message.transcript || '').toLowerCase();
 
-  if (!message?.type) {
-    console.log('⚠️ Webhook ignored (no type). Body keys:', Object.keys(req.body || {}));
-    // IMPORTANT: return 200 so Vapi doesn't mark webhook unhealthy
-    return res.status(200).json({ ignored: true });
-  }
+        const fraudKeywords = [
+            'otp', 'pin', 'cvv', 'password', 'blocked', 'suspended',
+            'arrest', 'police', 'legal action', 'pay now', 'transfer',
+            'kyc', 'verify', 'lottery', 'prize', 'winner',
+            'anydesk', 'teamviewer',
+            'गिरफ्तार', 'ब्लॉक', 'केवाईसी', 'पैसे भेजो'
+        ];
 
-  console.log('📥 Vapi Event:', message.type);
+        const detected = fraudKeywords.filter(keyword =>
+            transcript.includes(keyword)
+        );
 
-  // -------- Transcript (FAST detection) --------
-  if (message.type === 'transcript') {
-    const raw = message.transcript || '';
-    const text = raw.toLowerCase();
-    const callId = message.call?.id || message.callId || 'unknown';
-    const transcriptType = message.transcriptType || 'unknown';
+        if (detected.length > 0) {
+            console.log('🚨 FRAUD DETECTED:', detected);
 
-    const detected = fraudKeywords.filter(k => text.includes(k));
+            // Send alert to mobile apps
+            sendAlertToApps({
+                type: 'FRAUD_ALERT',
+                severity: detected.length >= 2 ? 'HIGH' : 'MEDIUM',
+                keywords: detected,
+                transcript: message.transcript,
+                callId: message.call?.id,
+                confidence: Math.min(95, detected.length * 30),
+                timestamp: Date.now()
+            });
 
-    if (detected.length > 0 && !fraudTriggeredCalls.has(callId)) {
-      fraudTriggeredCalls.add(callId);
+            // Trigger AI agent to call scammer
+            const scammerNumber = message.call?.customer?.number;
+            if (scammerNumber) {
+                console.log('📞 Triggering agent for:', scammerNumber);
+                triggerAgent(scammerNumber);
+            }
+        }
+    }
 
-      console.log(`🚨 FRAUD DETECTED (${transcriptType}) callId=${callId} kws=${detected.join(',')}`);
+    // Honeypot tool-call logging
+    if (message?.type === 'tool-calls') {
+        const toolCall = message.toolCallList?.[0];
 
-      sendToApps({
+        if (toolCall?.function?.name === 'log_scam_data') {
+            console.log('📝 SCAM DATA:', toolCall.function.arguments);
+
+            sendAlertToApps({
+                type: 'SCAM_DATA_CAPTURED',
+                data: toolCall.function.arguments,
+                callId: message.call?.id,
+                timestamp: Date.now()
+            });
+
+            return res.json({
+                results: [
+                    {
+                        toolCallId: toolCall.id,
+                        result: 'Logged'
+                    }
+                ]
+            });
+        }
+    }
+
+    res.json({ success: true });
+});
+
+// ============================================
+// TEST ALERT ENDPOINT
+// ============================================
+app.post('/test-alert', (req, res) => {
+    sendAlertToApps({
         type: 'FRAUD_ALERT',
-        severity: detected.length >= 2 ? 'HIGH' : 'MEDIUM',
-        keywords: [...new Set(detected)],
-        transcript: raw,
-        transcriptType,
-        callId,
-        confidence: Math.min(95, detected.length * 30),
+        severity: 'HIGH',
+        keywords: ['otp', 'kyc'],
+        transcript: 'Test: Please share your OTP for KYC',
+        confidence: 90,
         timestamp: Date.now()
-      });
-    }
-  }
-
-  // -------- Tool calls (scam intel) --------
-  if (message.type === 'tool-calls') {
-    const toolCall = message.toolCallList?.[0];
-    const callId = message.call?.id || 'unknown';
-
-    if (toolCall?.function?.name === 'log_scam_data') {
-      let args = toolCall.function.arguments;
-      if (typeof args === 'string') {
-        try { args = JSON.parse(args); } catch {}
-      }
-
-      console.log('📝 SCAM DATA:', args);
-
-      sendToApps({
-        type: 'SCAM_DATA_CAPTURED',
-        data: args,
-        callId,
-        timestamp: Date.now()
-      });
-
-      return res.json({
-        results: [{ toolCallId: toolCall.id, result: 'Logged' }]
-      });
-    }
-  }
-
-  // -------- Call lifecycle (optional but useful) --------
-  if (message.type === 'status-update') {
-    sendToApps({
-      type: 'CALL_STATUS',
-      status: message.status,
-      callId: message.call?.id,
-      timestamp: Date.now()
     });
 
-    if (message.status === 'ended' && message.call?.id) {
-      fraudTriggeredCalls.delete(message.call.id);
-    }
-  }
-
-  return res.json({ success: true });
+    res.json({ sent: true });
 });
 
 // ============================================
-// Health Check
+// HEALTH CHECK
 // ============================================
 app.get('/health', (req, res) => {
-  res.json({
-    status: 'ok',
-    activeConnections: connectedApps.size,
-    alertedCalls: fraudTriggeredCalls.size,
-    timestamp: Date.now()
-  });
+    res.json({
+        status: 'ok',
+        activeConnections: connectedApps.size,
+        timestamp: Date.now()
+    });
 });
 
 // ============================================
-// Start Server (Render-safe)
+// START SERVER
 // ============================================
-const PORT = process.env.PORT || 10000;
+const PORT = process.env.PORT || 3000;
 
 server.listen(PORT, () => {
-  console.log(`🛡️ Server running on port ${PORT}`);
-  console.log('Webhook: POST /vapi-webhook');
-  console.log('WS: wss://<your-render-url>');
-});
+    console.log(`🛡️ Server running on port ${PORT}`);
+    console.log(`Webhook URL: ${BASE_URL}/vapi-webhook`);
+    console.log(`Health Check: ${BASE_URL}/health`);
+    console.log(`WebSocket: wss://detectscam.onrender.com`);
